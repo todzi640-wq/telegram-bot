@@ -1,0 +1,518 @@
+import asyncio
+import logging
+import sqlite3
+import random
+import time
+import aiohttp
+from datetime import datetime, timedelta
+from typing import Any, Dict, List
+from aiogram import Bot, Dispatcher, F, Router, BaseMiddleware
+from aiogram.filters import Command, CommandStart
+from aiogram.fsm.context import FSMContext
+from aiogram.fsm.state import State, StatesGroup
+from aiogram.fsm.storage.memory import MemoryStorage
+from aiogram.types import (
+    CallbackQuery,
+    InlineKeyboardButton,
+    InlineKeyboardMarkup,
+    KeyboardButton,
+    Message,
+    ReplyKeyboardMarkup,
+    InputMediaPhoto,
+)
+
+BOT_TOKEN = "8818208428:AAFTVUpZq2GP0MeM48TRAjUW01V8CaUQAqM"
+OWNER_IDS = [8945838476]
+CHANNEL_ID = "@corvus_rep24"
+ADMIN_USERNAME = "@geamatoma"
+
+CARD_NUMBER = "+7 982 838 28 36"
+CARD_BANK = "Сбербанк"
+
+PRICES = {
+    "ad_2h": {"title": "2 часа в канале", "price": 1.5, "duration": 2 * 3600},
+    "ad_1d": {"title": "1 день (24 часа)", "price": 3.5, "duration": 24 * 3600},
+}
+
+SUPPORT_TEMPLATES = {
+    "tpl_clarify": "Здравствуйте! Уточните, пожалуйста, ваш вопрос подробнее, чтобы мы могли вам помочь.",
+    "tpl_offtop": "Здравствуйте! Данный вопрос является оффтопом и не относится к работе нашего сервиса.",
+    "tpl_wait": "Здравствуйте! Ваш вопрос принят в обработку. Пожалуйста, ожидайте, мы уже разбираемся.",
+    "tpl_solved": "Здравствуйте! Ваша проблема решена. Если возникнут дополнительные вопросы — обращайтесь!",
+    "tpl_ad_rules": "Здравствуйте! Мы не рекламируем скам-проекты, наркотики и каналы без контента. Перед покупкой убедитесь, что ваш пост соответствует правилам.",
+    "tpl_no_proof": "Здравствуйте! Вы подали жалобу на скамера, но не приложили доказательств (скриншотов). Без пруфов жалоба не будет опубликована.",
+    "tpl_fake_check": "Здравствуйте! Система обнаружила попытку отправить фейковый чек. Это грубое нарушение правил и ведет к вечному бану.",
+    "tpl_withdraw_info": "Здравствуйте! Вывод средств в данный момент недоступен. По всем вопросам баланса обращайтесь к владельцу.",
+    "tpl_refund_policy": "Здравствуйте! Согласно правилам нашего сервиса, возврат средств за уже оказанные услуги (реклама) не производится."
+}
+
+logging.basicConfig(level=logging.INFO)
+
+def parse_duration_string(text: str):
+    text = text.strip().lower()
+    if text in ["0", "вечно", "навсегда", "perm", "permanent", "вечный"]:
+        return 0, "навсегда"
+    
+    unit = text[-1]
+    num_part = text[:-1]
+    if not num_part.isdigit():
+        if text.isdigit():
+            val = int(text)
+            return val * 3600, f"{val} ч."
+        return None, None
+    
+    val = int(num_part)
+    if unit in ["m", "м", "мин"]:
+        return val * 60, f"{val} мин."
+    elif unit in ["h", "ч", "час", "часов"]:
+        return val * 3600, f"{val} ч."
+    elif unit in ["d", "д", "дн", "дней"]:
+        return val * 86400, f"{val} дн."
+    elif unit in ["w", "н", "нед"]:
+        return val * 7 * 86400, f"{val} нед."
+    return None, None
+
+def format_timestamp(ts: int):
+    if not ts or ts == 0:
+        return "навсегда"
+    return datetime.fromtimestamp(ts).strftime("%d.%m.%Y %H:%M")
+
+async def safe_edit_text(message, text, reply_markup=None, parse_mode=None):
+    try:
+        await message.edit_text(text, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            logging.error(f"edit_text error: {e}")
+
+async def safe_edit_caption(message, caption, reply_markup=None, parse_mode=None):
+    try:
+        await message.edit_caption(caption=caption, reply_markup=reply_markup, parse_mode=parse_mode)
+    except Exception as e:
+        if "message is not modified" not in str(e):
+            logging.error(f"edit_caption error: {e}")
+
+class AlbumMiddleware(BaseMiddleware):
+    def __init__(self, latency: float = 0.6):
+        self.latency = latency
+        self.album_data = {}
+
+    async def __call__(self, handler, event: Message, data: Dict[str, Any]):
+        if not event.media_group_id:
+            return await handler(event, data)
+        try:
+            self.album_data[event.media_group_id].append(event)
+            return
+        except KeyError:
+            self.album_data[event.media_group_id] = [event]
+            await asyncio.sleep(self.latency)
+            data["album"] = self.album_data.pop(event.media_group_id)
+            return await handler(event, data)
+
+bot = Bot(token=BOT_TOKEN)
+dp = Dispatcher(storage=MemoryStorage())
+router = Router()
+router.message.middleware(AlbumMiddleware())
+dp.include_router(router)
+
+def init_db():
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS users (
+            user_id INTEGER PRIMARY KEY,
+            username TEXT,
+            is_banned INTEGER DEFAULT 0,
+            ban_until INTEGER DEFAULT 0,
+            ban_reason TEXT,
+            mute_until INTEGER DEFAULT 0,
+            mute_reason TEXT,
+            is_admin INTEGER DEFAULT 0,
+            balance REAL DEFAULT 0
+        )
+    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS reports (id INTEGER PRIMARY KEY AUTOINCREMENT, user_id INTEGER, scammer_info TEXT)")
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS card_payments (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            plan_key TEXT,
+            status TEXT DEFAULT 'pending',
+            kind TEXT DEFAULT 'ad'
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS earnings (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            amount REAL,
+            method TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("""
+        CREATE TABLE IF NOT EXISTS support_tickets (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            user_id INTEGER,
+            username TEXT,
+            full_name TEXT,
+            message TEXT,
+            status TEXT DEFAULT 'open',
+            admin_id INTEGER,
+            admin_username TEXT,
+            created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP
+        )
+    """)
+    cursor.execute("CREATE TABLE IF NOT EXISTS settings (key TEXT PRIMARY KEY, value TEXT)")
+
+    cursor.execute("PRAGMA table_info(users)")
+    cols = [r[1] for r in cursor.fetchall()]
+    if "username" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN username TEXT")
+    if "is_banned" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN is_banned INTEGER DEFAULT 0")
+    if "ban_until" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN ban_until INTEGER DEFAULT 0")
+    if "ban_reason" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN ban_reason TEXT")
+    if "mute_until" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN mute_until INTEGER DEFAULT 0")
+    if "mute_reason" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN mute_reason TEXT")
+    if "is_admin" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN is_admin INTEGER DEFAULT 0")
+    if "balance" not in cols:
+        cursor.execute("ALTER TABLE users ADD COLUMN balance REAL DEFAULT 0")
+
+    cursor.execute("PRAGMA table_info(card_payments)")
+    cols = [r[1] for r in cursor.fetchall()]
+    if "kind" not in cols:
+        cursor.execute("ALTER TABLE card_payments ADD COLUMN kind TEXT DEFAULT 'ad'")
+
+    cursor.execute("PRAGMA table_info(support_tickets)")
+    cols = [r[1] for r in cursor.fetchall()]
+    if "admin_id" not in cols:
+        cursor.execute("ALTER TABLE support_tickets ADD COLUMN admin_id INTEGER")
+    if "admin_username" not in cols:
+        cursor.execute("ALTER TABLE support_tickets ADD COLUMN admin_username TEXT")
+
+    conn.commit()
+    conn.close()
+
+def get_setting(key):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT value FROM settings WHERE key = ?", (key,))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] if res else None
+
+def set_setting(key, value):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO settings (key, value) VALUES (?, ?) ON CONFLICT(key) DO UPDATE SET value=excluded.value", (key, value))
+    conn.commit()
+    conn.close()
+
+def is_owner(user_id):
+    return user_id in OWNER_IDS
+
+def is_admin(user_id):
+    if user_id in OWNER_IDS:
+        return True
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_admin FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res[0] == 1 if res else False
+
+async def check_user_subscription(user_id: int):
+    if is_owner(user_id):
+        return True
+    target = get_setting("required_channel")
+    if not target:
+        return True
+    try:
+        member = await bot.get_chat_member(chat_id=target, user_id=user_id)
+        if member.status in ["member", "administrator", "creator"]:
+            return True
+        return False
+    except Exception as e:
+        logging.error(f"Subscription check error: {e}")
+        return True
+
+def add_user(user_id, username):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO users (user_id, username) VALUES (?, ?) ON CONFLICT(user_id) DO UPDATE SET username=excluded.username", (user_id, username))
+    conn.commit()
+    conn.close()
+
+def get_balance(user_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT balance FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return round(res[0], 2) if res and res[0] else 0.0
+
+def set_balance(user_id, amount):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE users SET balance = ? WHERE user_id = ?", (round(amount, 2), user_id))
+    conn.commit()
+    conn.close()
+
+def change_balance(user_id, delta):
+    new_balance = get_balance(user_id) + delta
+    if new_balance < 0:
+        new_balance = 0
+    set_balance(user_id, new_balance)
+    return new_balance
+
+def check_ban(user_id):
+    if is_owner(user_id):
+        return False, None, 0
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT is_banned, ban_until, ban_reason FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    if not res:
+        return False, None, 0
+    is_b, until, reason = res
+    if not is_b:
+        return False, None, 0
+    now = int(time.time())
+    if until == 0 or until > now:
+        return True, reason or "Не указана", until
+    else:
+        conn = sqlite3.connect("bot_database.db")
+        c = conn.cursor()
+        c.execute("UPDATE users SET is_banned = 0, ban_until = 0, ban_reason = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        return False, None, 0
+
+def check_mute(user_id):
+    if is_owner(user_id):
+        return False, None, 0
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT mute_until, mute_reason FROM users WHERE user_id = ?", (user_id,))
+    res = cursor.fetchone()
+    conn.close()
+    if not res:
+        return False, None, 0
+    until, reason = res
+    if not until:
+        return False, None, 0
+    now = int(time.time())
+    if until == 0 or until > now:
+        return True, reason or "Не указана", until
+    else:
+        conn = sqlite3.connect("bot_database.db")
+        c = conn.cursor()
+        c.execute("UPDATE users SET mute_until = 0, mute_reason = NULL WHERE user_id = ?", (user_id,))
+        conn.commit()
+        conn.close()
+        return False, None, 0
+
+def set_admin(target, status=1):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    target = target.strip()
+    if target.isdigit():
+        cursor.execute("UPDATE users SET is_admin = ? WHERE user_id = ?", (status, int(target)))
+    else:
+        cursor.execute("UPDATE users SET is_admin = ? WHERE LOWER(username) = ?", (status, target.replace("@", "").lower()))
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count > 0
+
+def ban_user_logic(target, duration_sec=0, reason="Нарушение правил"):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    target = target.strip()
+    ban_until = 0 if duration_sec == 0 else int(time.time()) + duration_sec
+    if target.isdigit():
+        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (int(target),))
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute("INSERT INTO users (user_id, is_banned, ban_until, ban_reason) VALUES (?, 1, ?, ?)", (int(target), ban_until, reason))
+        else:
+            cursor.execute("UPDATE users SET is_banned = 1, ban_until = ?, ban_reason = ? WHERE user_id = ?", (ban_until, reason, int(target)))
+        found_id = int(target)
+    else:
+        u = target.replace("@", "").lower()
+        cursor.execute("SELECT user_id FROM users WHERE LOWER(username) = ?", (u,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False, None
+        found_id = row[0]
+        cursor.execute("UPDATE users SET is_banned = 1, ban_until = ?, ban_reason = ? WHERE user_id = ?", (ban_until, reason, found_id))
+    conn.commit()
+    conn.close()
+    return True, found_id
+
+def unban_user_logic(target):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    target = target.strip()
+    if target.isdigit():
+        cursor.execute("UPDATE users SET is_banned = 0, ban_until = 0, ban_reason = NULL WHERE user_id = ?", (int(target),))
+    else:
+        cursor.execute("UPDATE users SET is_banned = 0, ban_until = 0, ban_reason = NULL WHERE LOWER(username) = ?", (target.replace("@", "").lower(),))
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count > 0
+
+def mute_user_logic(target, duration_sec=0, reason="Нарушение правил"):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    target = target.strip()
+    mute_until = 0 if duration_sec == 0 else int(time.time()) + duration_sec
+    if target.isdigit():
+        cursor.execute("SELECT user_id FROM users WHERE user_id = ?", (int(target),))
+        row = cursor.fetchone()
+        if not row:
+            cursor.execute("INSERT INTO users (user_id, mute_until, mute_reason) VALUES (?, ?, ?)", (int(target), mute_until, reason))
+        else:
+            cursor.execute("UPDATE users SET mute_until = ?, mute_reason = ? WHERE user_id = ?", (mute_until, reason, int(target)))
+        found_id = int(target)
+    else:
+        u = target.replace("@", "").lower()
+        cursor.execute("SELECT user_id FROM users WHERE LOWER(username) = ?", (u,))
+        row = cursor.fetchone()
+        if not row:
+            conn.close()
+            return False, None
+        found_id = row[0]
+        cursor.execute("UPDATE users SET mute_until = ?, mute_reason = ? WHERE user_id = ?", (mute_until, reason, found_id))
+    conn.commit()
+    conn.close()
+    return True, found_id
+
+def unmute_user_logic(target):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    target = target.strip()
+    if target.isdigit():
+        cursor.execute("UPDATE users SET mute_until = 0, mute_reason = NULL WHERE user_id = ?", (int(target),))
+    else:
+        cursor.execute("UPDATE users SET mute_until = 0, mute_reason = NULL WHERE LOWER(username) = ?", (target.replace("@", "").lower(),))
+    count = cursor.rowcount
+    conn.commit()
+    conn.close()
+    return count > 0
+
+def create_support_ticket(user_id, username, full_name, message_text):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO support_tickets (user_id, username, full_name, message, status) VALUES (?, ?, ?, ?, 'open')", (user_id, username, full_name, message_text))
+    ticket_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return ticket_id
+
+def get_support_ticket(ticket_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT id, user_id, username, full_name, message, status, admin_id, admin_username FROM support_tickets WHERE id = ?", (ticket_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def update_ticket_admin(ticket_id, admin_id, admin_username):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE support_tickets SET status = 'in_progress', admin_id = ?, admin_username = ? WHERE id = ?", (admin_id, admin_username, ticket_id))
+    conn.commit()
+    conn.close()
+
+def close_support_ticket(ticket_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE support_tickets SET status = 'closed' WHERE id = ?", (ticket_id,))
+    conn.commit()
+    conn.close()
+
+def create_card_payment(user_id, plan_key, kind="ad"):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO card_payments (user_id, plan_key, status, kind) VALUES (?, ?, 'pending', ?)", (user_id, plan_key, kind))
+    payment_id = cursor.lastrowid
+    conn.commit()
+    conn.close()
+    return payment_id
+
+def get_card_payment(payment_id):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("SELECT user_id, plan_key, status, kind FROM card_payments WHERE id = ?", (payment_id,))
+    res = cursor.fetchone()
+    conn.close()
+    return res
+
+def update_card_payment_status(payment_id, status):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("UPDATE card_payments SET status = ? WHERE id = ?", (status, payment_id))
+    conn.commit()
+    conn.close()
+
+def add_earning(user_id, amount, method):
+    conn = sqlite3.connect("bot_database.db")
+    cursor = conn.cursor()
+    cursor.execute("INSERT INTO earnings (user_id, amount, method) VALUES (?, ?, ?)", (user_id, amount, method))
+    conn.commit()
+    conn.close()
+
+async def create_crypto_invoice(amount: float, description: str):
+    token = get_setting("crypto_token")
+    if not token:
+        return None, "CryptoBot токен не привязан"
+    headers = {"Crypto-Pay-API-Token": token, "Content-Type": "application/json"}
+    payload = {"asset": "USDT", "amount": str(amount), "description": description, "payload": "ad_payment"}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.post("https://pay.crypt.bot/api/createInvoice", headers=headers, json=payload) as resp:
+                res = await resp.json()
+                if res.get("ok"):
+                    return res["result"], None
+                return None, res.get("error", {}).get("name", "unknown_error")
+    except Exception as e:
+        return None, str(e)
+
+async def check_crypto_invoice(invoice_id: int):
+    token = get_setting("crypto_token")
+    if not token:
+        return False
+    headers = {"Crypto-Pay-API-Token": token}
+    try:
+        async with aiohttp.ClientSession() as session:
+            async with session.get("https://pay.crypt.bot/api/getInvoices", headers=headers, params={"invoice_ids": str(invoice_id)}) as resp:
+                res = await resp.json()
+                if res.get("ok"):
+                    items = res.get("result", {}).get("items", [])
+                    if items:
+                        return items[0].get("status") == "paid"
+    except Exception as e:
+        logging.error(f"check_crypto_invoice error: {e}")
+    return False
+
+class ReportScammer(StatesGroup):
+    waiting_for_scammer_info = State()
+    waiting_for_proof_text = State()
+    waiting_for_photo = State()
+
+class BuyAd(StatesGroup):
+    waiting_for_payment = State()
+    waiting_for_ad_content = State()
+    waiting_for_card_proof = State()
+
+class TopUp(StatesGroup):
+    waiting_for_amount = State()
